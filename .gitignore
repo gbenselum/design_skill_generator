@@ -1,6 +1,19 @@
 .DS_Store
 *.zip
+*.log
+temp_*/
+
+# Pipeline build state
 cache/
 raw_data/
-temp_*/
-*.log
+assets/
+fonts/
+url_to_assets_map.json
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated provenance
+!skills/design_skill_generator/config.example.json

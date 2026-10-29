@@ -1,230 +1,395 @@
-import os
-import json
-import re
+#!/usr/bin/env python3
+"""compiler.py - turn crawled Contentful / Rich Text page JSON into Markdown guides.
 
-def clean_text(text_obj):
-    """
-    Recursively converts standard headless CMS / Contentful Rich Text structures
-    into clean Markdown format.
-    """
+Stage 3 of the pipeline. Reads the JSON written by ``crawler.py``, converts Rich Text AST nodes
+to Markdown, renders tables and colour lists, rewrites image links to local assets, and writes one
+guide per section.
+
+Standard library only. Python 3.9+.
+
+CLI:
+    python3 compiler.py --config config.json
+    python3 compiler.py components raw_data references/components.md url_to_assets_map.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any
+
+# Content-type ids this compiler knows how to render. Override them in config.json under
+# "content_types" when a portal uses different names. Anything unlisted still gets rendered as
+# text by render_unknown(), so no content is silently dropped.
+DEFAULT_TYPES: dict[str, list[str]] = {
+    "image": ["figmaImage"],
+    "image_group": ["multipleFigmaImages"],
+    "table": ["table"],
+    "color_list": ["colorBlocks"],
+    "group": ["section"],
+}
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def content_type(block: Any) -> str | None:
+    """Return the Contentful content-type id of a block, if it has one."""
+    if not isinstance(block, dict):
+        return None
+    return (
+        block.get("sys", {})
+        .get("contentType", {})
+        .get("sys", {})
+        .get("id")
+    )
+
+
+def type_role(block: Any, types: dict[str, list[str]]) -> str | None:
+    """Map a block to a rendering role: image, image_group, table, color_list or group."""
+    block_type = content_type(block)
+    if not block_type:
+        return None
+    for role, names in types.items():
+        if block_type in names:
+            return role
+    return None
+
+
+def clean_text(text_obj: Any) -> str:
+    """Convert Contentful Rich Text nodes to Markdown."""
     if not text_obj:
         return ""
     if isinstance(text_obj, str):
         return text_obj.strip()
-    if isinstance(text_obj, dict):
-        node_type = text_obj.get('nodeType', '')
-        
-        # Text Node
-        if node_type == 'text':
-            val = text_obj.get('value', '')
-            marks = [m.get('type') for m in text_obj.get('marks', []) if isinstance(m, dict)]
-            if 'bold' in marks:
-                val = f"**{val}**"
-            if 'underline' in marks:
-                val = f"<u>{val}</u>"
-            return val
-            
-        # Hyperlinks & Entry references
-        if 'hyperlink' in node_type or 'entry' in node_type or 'asset' in node_type:
-            uri = text_obj.get('data', {}).get('uri', '')
-            label = ""
-            for child in text_obj.get('content', []):
-                label += clean_text(child)
-            if uri:
-                return f"[{label if label else uri}]({uri})"
-            return label
-            
-        # Container Nodes
-        children = text_obj.get('content', [])
-        result = ""
-        for child in children:
-            result += clean_text(child)
-            
-        if node_type == 'paragraph':
-            return result + "\n\n"
-        elif node_type == 'list-item':
-            result_clean = result.strip().replace('\n\n', '\n')
-            return f"- {result_clean}\n"
-        elif node_type == 'unordered-list':
-            return result + "\n"
-        elif node_type == 'ordered-list':
-            return result + "\n"
-        elif node_type.startswith('heading-'):
-            try:
-                level = int(node_type.split('-')[-1])
-            except ValueError:
-                level = 3
-            return f"\n{'#' * (level + 2)} {result.strip()}\n\n"
-        elif node_type == 'document':
-            return result
-            
-        return result
-        
     if isinstance(text_obj, list):
-        return "".join([clean_text(item) for item in text_obj])
-        
-    return str(text_obj)
+        return "".join(clean_text(item) for item in text_obj)
+    if not isinstance(text_obj, dict):
+        return str(text_obj)
 
-def parse_table(table_block):
-    """
-    Parses structural table blocks into standard Markdown table format.
-    """
-    if not table_block: return ""
-    fields = table_block.get('fields', {})
-    rows = fields.get('rows', [])
-    if not rows: return ""
-    
-    markdown = ""
-    has_header = fields.get('hasHeader', True)
-    
-    header_cells = []
-    if has_header and len(rows) > 0:
-        header_cells = [clean_text(c.get('fields', {}).get('body', '')).strip().replace('\n', '<br>') for c in rows[0].get('fields', {}).get('cells', [])]
+    node_type = text_obj.get("nodeType", "")
+
+    if node_type == "text":
+        value = text_obj.get("value", "")
+        marks = [m.get("type") for m in text_obj.get("marks", []) if isinstance(m, dict)]
+        if "bold" in marks or "strong" in marks:
+            value = f"**{value}**"
+        if "italic" in marks:
+            value = f"*{value}*"
+        if "underline" in marks:
+            value = f"<u>{value}</u>"
+        if "code" in marks:
+            value = f"`{value}`"
+        return value
+
+    if "hyperlink" in node_type or node_type in {"entry-hyperlink", "asset-hyperlink"}:
+        uri = (text_obj.get("data") or {}).get("uri", "")
+        label = "".join(clean_text(child) for child in text_obj.get("content", []))
+        if uri:
+            return f"[{label or uri}]({uri})"
+        return label
+
+    body = "".join(clean_text(child) for child in text_obj.get("content", []))
+
+    if node_type == "paragraph":
+        return body + "\n\n"
+    if node_type == "list-item":
+        return "- " + body.strip().replace("\n\n", "\n") + "\n"
+    if node_type in {"unordered-list", "ordered-list"}:
+        return body + "\n"
+    if node_type in {"blockquote", "quote"}:
+        return "> " + body.strip() + "\n\n"
+    if node_type == "code-block":
+        return "```\n" + body.strip() + "\n```\n\n"
+    if node_type in {"hr", "horizontal-rule"}:
+        return "\n---\n\n"
+    if node_type.startswith("heading-"):
+        try:
+            level = int(node_type.rsplit("-", 1)[-1])
+        except ValueError:
+            level = 3
+        return f"\n{'#' * (level + 2)} {body.strip()}\n\n"
+
+    return body
+
+
+def parse_table(table_block: Any, types: dict | None = None) -> str:
+    """Render a Contentful table block as a GitHub-flavoured Markdown table."""
+    if not table_block:
+        return ""
+    fields = table_block.get("fields", {}) or {}
+    rows = fields.get("rows", []) or []
+    if not rows:
+        return ""
+
+    def cells_of(row: dict) -> list[str]:
+        return [
+            clean_text((cell.get("fields", {}) or {}).get("body", "")).strip().replace("\n", "<br>")
+            for cell in (row.get("fields", {}) or {}).get("cells", [])
+        ]
+
+    has_header = fields.get("hasHeader", True)
+    if has_header:
+        header_cells = cells_of(rows[0])
         start_row = 1
     else:
-        if len(rows) > 0:
-            first_row_cells = rows[0].get('fields', {}).get('cells', [])
-            header_cells = [f"Col {i+1}" for i in range(len(first_row_cells))]
+        header_cells = [f"Col {i + 1}" for i in range(len(cells_of(rows[0])))]
         start_row = 0
-        
-    if not header_cells: return ""
-    
-    markdown += "| " + " | ".join(header_cells) + " |\n"
+
+    if not header_cells:
+        return ""
+
+    markdown = "| " + " | ".join(header_cells) + " |\n"
     markdown += "| " + " | ".join(["---"] * len(header_cells)) + " |\n"
-    
-    for r in rows[start_row:]:
-        cells = [clean_text(c.get('fields', {}).get('body', '')).strip().replace('\n', '<br>') for c in r.get('fields', {}).get('cells', [])]
-        if cells:
-            while len(cells) < len(header_cells):
-                cells.append("")
-            markdown += "| " + " | ".join(cells[:len(header_cells)]) + " |\n"
-            
+
+    for row in rows[start_row:]:
+        cells = cells_of(row)
+        if not cells:
+            continue
+        while len(cells) < len(header_cells):
+            cells.append("")
+        markdown += "| " + " | ".join(cells[: len(header_cells)]) + " |\n"
+
     return markdown
 
-def render_figma_images(block, url_to_assets_map):
-    """
-    Finds and replaces image links with local asset references.
-    """
-    if not block: return ""
-    b_type = block.get('sys', {}).get('contentType', {}).get('sys', {}).get('id')
-    bf = block.get('fields', {})
-    
-    if b_type == 'figmaImage':
-        url = bf.get('url')
-        alt = bf.get('altText') or bf.get('figmaReference') or 'Design Preview'
-        local_name = url_to_assets_map.get(url)
+
+def render_image(block: Any, asset_map: dict, types: dict) -> str:
+    """Render an image block as a local Markdown image reference."""
+    if not block:
+        return ""
+
+    role = type_role(block, types)
+    fields = block.get("fields", {}) or {}
+
+    if role == "image":
+        url = fields.get("url")
+        alt = fields.get("altText") or fields.get("figmaReference") or "Design preview"
+        local_name = asset_map.get(url)
         if local_name:
             return f"![{alt}](../assets/{local_name})\n\n"
-            
-    if b_type == 'multipleFigmaImages':
-        markdown = ""
-        for ref in bf.get('figmaReferences', []):
-            markdown += render_figma_images(ref, url_to_assets_map)
-        return markdown
-        
+        return ""
+
+    if role == "image_group":
+        return "".join(
+            render_image(ref, asset_map, types)
+            for ref in fields.get("figmaReferences", []) or []
+        )
+
     return ""
 
-def compile_category(category_name, input_dir, output_file, url_to_assets_map):
-    cat_dir = os.path.join(input_dir, category_name)
-    if not os.path.exists(cat_dir):
-        print(f"Category folder not found: {cat_dir}")
-        return
-        
-    md_content = f"# Design System - {category_name.title()}\n\nThis guide covers the {category_name} references of the visual identity.\n\n"
-    
-    filenames = sorted(os.listdir(cat_dir))
-    for filename in filenames:
-        if not filename.endswith('.json'): continue
-        filepath = os.path.join(cat_dir, filename)
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-            
-        title = data.get('title', filename[:-5].replace("-", " ").title())
-        md_content += f"## {title}\n\n"
-        
-        # Load header
-        header = data.get('header', {})
+
+def render_color_list(block: Any, types: dict) -> str:
+    """Render a colour palette block as a table. Skips items marked as blank."""
+    fields = block.get("fields", {}) or {}
+    markdown = f"#### {fields.get('title', 'Colors')}\n\n"
+    markdown += "| Color Name | Hex (Light) | Hex (Dark) | Token | Description |\n"
+    markdown += "| --- | --- | --- | --- | --- |\n"
+    for item in fields.get("colorBlockItems", []) or []:
+        item_fields = item.get("fields", {}) or {}
+        if item_fields.get("useAsBlank"):
+            continue
+        name = item_fields.get("colorName") or item_fields.get("captionTitle") or "Color"
+        light = item_fields.get("hex", "")
+        dark = item_fields.get("hexDarkMode", "")
+        token = item_fields.get("backgroundToken") or item_fields.get("colorToken", "")
+        description = (item_fields.get("captionBody", "") or "").replace("\n", "<br>")
+        markdown += f"| {name} | `{light}` | `{dark}` | `{token}` | {description} |\n"
+    return markdown + "\n"
+
+
+def render_unknown(block: Any) -> str:
+    """Render a block type we have no rule for, instead of dropping it.
+
+    Design portals add content types over time. Silently losing a section is worse than an
+    imperfect heading, so unknown blocks degrade to their readable text.
+    """
+    fields = block.get("fields", {}) or {}
+    markdown = ""
+
+    title = fields.get("title") or fields.get("heading") or fields.get("name")
+    if isinstance(title, str) and title.strip():
+        markdown += f"#### {title.strip()}\n\n"
+
+    for key in ("subHeader", "content", "body", "text", "description", "captionBody"):
+        value = fields.get(key)
+        if not value:
+            continue
+        rendered = clean_text(value).strip()
+        if rendered:
+            markdown += rendered + "\n\n"
+
+    if markdown:
+        block_type = content_type(block) or "unknown"
+        markdown += f"<!-- unhandled content type: {block_type} -->\n\n"
+    return markdown
+
+
+def render_block(block: Any, asset_map: dict, types: dict, depth: int = 0) -> str:
+    """Dispatch one block to the right renderer."""
+    if not block:
+        return ""
+
+    role = type_role(block, types)
+    fields = block.get("fields", {}) or {}
+
+    if role == "image":
+        return render_image(block, asset_map, types)
+    if role == "image_group":
+        return render_image(block, asset_map, types)
+    if role == "table":
+        return parse_table(block, types) + "\n"
+    if role == "color_list":
+        return render_color_list(block, types)
+    if role == "group":
+        markdown = ""
+        nested_title = fields.get("title")
+        if nested_title:
+            markdown += f"{'#' * min(depth + 4, 6)} {nested_title}\n\n"
+        if fields.get("content"):
+            markdown += clean_text(fields.get("content")) + "\n"
+        for nested in fields.get("blocks", []) or []:
+            markdown += render_block(nested, asset_map, types, depth + 1)
+        return markdown
+
+    # Unhandled: render the text, never drop it.
+    return render_unknown(block)
+
+
+def compile_section(
+    category: str,
+    input_dir: str,
+    output_file: str,
+    asset_map: dict | None = None,
+    types: dict | None = None,
+    title: str | None = None,
+) -> str:
+    """Compile one section folder into one Markdown file. Returns the Markdown."""
+    asset_map = asset_map or {}
+    types = types or DEFAULT_TYPES
+    category_dir = os.path.join(input_dir, category)
+
+    if not os.path.exists(category_dir):
+        raise FileNotFoundError(f"Section folder not found: {category_dir}")
+
+    heading = title or category.replace("-", " ").title()
+    markdown = f"# Design System - {heading}\n\n"
+    markdown += f"This guide covers the {category} references of the design system.\n\n"
+
+    for filename in sorted(os.listdir(category_dir)):
+        if not filename.endswith(".json"):
+            continue
+        with open(os.path.join(category_dir, filename), "r", encoding="utf-8") as handle:
+            try:
+                data = json.load(handle)
+            except json.JSONDecodeError as exc:
+                print(f"Skipping {filename}: {exc}")
+                continue
+
+        page_title = data.get("title") or filename[:-5].replace("-", " ").title()
+        markdown += f"## {page_title}\n\n"
+
+        header = data.get("header")
         if isinstance(header, dict):
-            sub = header.get('fields', {}).get('subHeader')
-            if sub:
-                md_content += f"{clean_text(sub)}\n\n"
-            h_img = header.get('fields', {}).get('image')
-            if h_img:
-                md_content += render_figma_images(h_img, url_to_assets_map)
-                
-        # Parse content sections
-        sections = data.get('sections', [])
-        for sec in sections:
-            if not sec: continue
-            sec_fields = sec.get('fields', {})
-            sec_title = sec_fields.get('title')
-            if sec_title:
-                md_content += f"### {sec_title}\n\n"
-            sec_content = sec_fields.get('content')
-            if sec_content:
-                md_content += f"{clean_text(sec_content)}\n\n"
-                
-            # Parse nested blocks
-            for b in sec_fields.get('blocks', []):
-                if not b: continue
-                bf = b.get('fields', {})
-                b_type = b.get('sys', {}).get('contentType', {}).get('sys', {}).get('id')
-                
-                # Image embed
-                img_md = render_figma_images(b, url_to_assets_map)
-                if img_md:
-                    md_content += img_md
-                    
-                if b_type == 'table':
-                    md_content += parse_table(b) + "\n"
-                elif b_type == 'colorBlocks':
-                    md_content += f"#### {bf.get('title', 'Colors')}\n\n"
-                    md_content += "| Color Name | Hex (Light) | Hex (Dark) | Token | Description |\n"
-                    md_content += "| --- | --- | --- | --- | --- |\n"
-                    for item in bf.get('colorBlockItems', []):
-                        itf = item.get('fields', {})
-                        if itf.get('useAsBlank'): continue
-                        name = itf.get('colorName') or itf.get('captionTitle') or 'Color'
-                        hex_light = itf.get('hex', '')
-                        hex_dark = itf.get('hexDarkMode', '')
-                        token = itf.get('backgroundToken') or itf.get('colorToken', '')
-                        desc = itf.get('captionBody', '').replace('\n', '<br>')
-                        md_content += f"| {name} | `{hex_light}` | `{hex_dark}` | `{token}` | {desc} |\n"
-                    md_content += "\n"
-                elif b_type == 'section':
-                    nest_title = bf.get('title')
-                    if nest_title:
-                        md_content += f"#### {nest_title}\n\n"
-                    if bf.get('content'):
-                        md_content += f"{clean_text(bf.get('content'))}\n\n"
-                    for nest_b in bf.get('blocks', []):
-                        if not nest_b: continue
-                        nest_img = render_figma_images(nest_b, url_to_assets_map)
-                        if nest_img:
-                            md_content += nest_img
-                        if nest_b.get('sys', {}).get('contentType', {}).get('sys', {}).get('id') == 'table':
-                            md_content += parse_table(nest_b) + "\n"
-        md_content += "---\n\n"
-        
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(md_content)
-    print(f"Category compile complete: {output_file}")
+            header_fields = header.get("fields", {}) or {}
+            if header_fields.get("subHeader"):
+                markdown += clean_text(header_fields["subHeader"]) + "\n\n"
+            if header_fields.get("image"):
+                markdown += render_block(header_fields["image"], asset_map, types)
+
+        for section in data.get("sections", []) or []:
+            if not section:
+                continue
+            section_fields = section.get("fields", {}) or {}
+            if section_fields.get("title"):
+                markdown += f"### {section_fields['title']}\n\n"
+            if section_fields.get("content"):
+                markdown += clean_text(section_fields["content"]) + "\n\n"
+            for block in section_fields.get("blocks", []) or []:
+                markdown += render_block(block, asset_map, types, depth=1)
+
+        markdown += "---\n\n"
+
+    parent = os.path.dirname(output_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as handle:
+        handle.write(markdown)
+
+    print(f"Compiled {category} -> {output_file}")
+    return markdown
+
+
+# Backwards-compatible alias for the original function name.
+compile_category = compile_section
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="compiler.py",
+        description="Stage 3: compile crawled page JSON into a Markdown guide.",
+        epilog=(
+            "Example: compiler.py components raw_data references/components.md "
+            "url_to_assets_map.json"
+        ),
+    )
+    parser.add_argument("category", nargs="?", help="section folder inside --input, for example components")
+    parser.add_argument("input_dir", nargs="?", default="raw_data", help="crawler output directory")
+    parser.add_argument("output_file", nargs="?", help="Markdown file to write")
+    parser.add_argument("asset_map", nargs="?", help="JSON map of remote URL to local file name")
+    parser.add_argument("--config", help="JSON config file; compiles every section it lists")
+    parser.add_argument("--types", help="JSON file overriding content-type names")
+    parser.add_argument("--title", help="heading for the guide (default: section name)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    types = dict(DEFAULT_TYPES)
+    if args.types:
+        with open(args.types, "r", encoding="utf-8") as handle:
+            types.update(json.load(handle))
+
+    config: dict = {}
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        types.update(config.get("content_types") or {})
+
+    output_cfg = config.get("output") or {}
+    input_dir = output_cfg.get("raw") or args.input_dir
+    asset_map_path = output_cfg.get("asset_map") or args.asset_map
+    references_dir = output_cfg.get("references")
+    sections = config.get("sections") or ([args.category] if args.category else [])
+
+    asset_map: dict = {}
+    if asset_map_path and os.path.exists(asset_map_path):
+        with open(asset_map_path, "r", encoding="utf-8") as handle:
+            asset_map = json.load(handle)
+
+    if args.category and args.output_file:
+        compile_section(args.category, input_dir, args.output_file, asset_map, types, args.title)
+        return 0
+
+    if not sections or not references_dir:
+        build_parser().print_help()
+        return 2
+
+    for section in sections:
+        if not os.path.isdir(os.path.join(input_dir, section)):
+            print(f"Skipping {section}: nothing was crawled for it")
+            continue
+        compile_section(
+            section,
+            input_dir,
+            os.path.join(references_dir, f"{section}.md"),
+            asset_map,
+            types,
+        )
+    return 0
+
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 5:
-        print("Usage: python compiler.py [category_name] [input_dir] [output_file] [assets_map_json]")
-        print("Example: python compiler.py components raw_data references/components.md url_to_assets_map.json")
-    else:
-        cat = sys.argv[1]
-        inp = sys.argv[2]
-        out = sys.argv[3]
-        map_path = sys.argv[4]
-        
-        asset_map = {}
-        if os.path.exists(map_path):
-            with open(map_path, 'r') as f:
-                asset_map = json.load(f)
-                
-        compile_category(cat, inp, out, asset_map)
+    sys.exit(main())

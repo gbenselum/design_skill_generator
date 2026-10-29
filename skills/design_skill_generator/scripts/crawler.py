@@ -1,135 +1,262 @@
+#!/usr/bin/env python3
+"""crawler.py - discover routes on a Next.js design-documentation site and cache the page JSON.
+
+Stage 1 of the pipeline. Reads the inline ``__NEXT_DATA__`` block from the entry page, walks the
+navigation tree, and saves the payload of every route that starts with one of the requested
+sections.
+
+Standard library only. Python 3.9+.
+
+CLI:
+    python3 crawler.py --config config.json
+    python3 crawler.py https://docs.example.com/ foundations,components --output raw_data
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
 import re
-import json
+import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
+from typing import Any, Iterable
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
-def get_page_data(url, cache_dir="cache"):
-    """
-    Fetch a page and extract the Next.js __NEXT_DATA__ JSON payload.
-    Uses a local disk cache to avoid redundant hits.
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_key = re.sub(r'[^a-zA-Z0-9]', '_', url) + ".json"
-    cache_path = os.path.join(cache_dir, cache_key)
-    
-    if os.path.exists(cache_path):
-        with open(cache_path, 'r') as f:
-            return json.load(f)
-            
-    print(f"Fetching: {url}")
-    req = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with urllib.request.urlopen(req) as response:
-            html = response.read().decode('utf-8')
-            
-        # Parse Next.js static JSON block
-        pattern = r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>'
-        match = re.search(pattern, html)
-        if match:
-            json_str = match.group(1)
-            data = json.loads(json_str)
-            with open(cache_path, 'w') as f:
-                json.dump(data, f, indent=2)
-            time.sleep(0.5) # Citizen delay
-            return data
-        else:
-            print(f"Warning: No __NEXT_DATA__ found for {url}")
+# Where a Next.js portal keeps its route tree. The first path that resolves wins.
+DEFAULT_NAV_PATHS = (
+    "props.pageProps.pages",
+    "props.pageProps.navigation",
+    "pageProps.pages",
+    "pageProps.navigation",
+    "props.pages",
+    "props.navigation",
+)
+
+# Where the page body lives inside the payload.
+DEFAULT_CONTENT_PATHS = ("props.pageProps.page", "pageProps.page")
+
+NEXT_DATA_PATTERN = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.DOTALL
+)
+
+
+def resolve_path(obj: Any, dotted: str) -> Any:
+    """Return the value at ``"a.b.c"`` in nested dicts, or None."""
+    current = obj
+    for part in dotted.split("."):
+        if not isinstance(current, dict):
             return None
-    except urllib.error.HTTPError as e:
-        print(f"HTTP Error {e.code} for URL: {url}")
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+def cache_name(url: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "_", url) + ".json"
+
+
+def fetch_page_data(
+    url: str,
+    cache_dir: str = "cache",
+    delay: float = 0.5,
+    user_agent: str = DEFAULT_USER_AGENT,
+    force: bool = False,
+) -> dict | None:
+    """Fetch a page and return its ``__NEXT_DATA__`` payload. Uses a disk cache."""
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, cache_name(url))
+
+    if os.path.exists(cache_path) and not force:
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            # A corrupt cache entry must not stop the run.
+            pass
+
+    print(f"Fetching: {url}")
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    try:
+        with urllib.request.urlopen(request) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        print(f"HTTP error {exc.code} for {url}")
         return None
-    except Exception as e:
-        print(f"Error fetching URL {url}: {e}")
+    except Exception as exc:  # noqa: BLE001 - a bad page must not kill the crawl
+        print(f"Error fetching {url}: {exc}")
         return None
 
-def extract_nested_paths(pages_list, target_prefixes):
-    """
-    Recursively filters a list of pages/routes from the __NEXT_DATA__ layout.
-    """
-    matched_slugs = []
-    
-    def walk_tree(items):
-        if not items: return
+    match = NEXT_DATA_PATTERN.search(html)
+    if not match:
+        print(f"Warning: no __NEXT_DATA__ block in {url}. Not a server-rendered Next.js page?")
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        print(f"Warning: __NEXT_DATA__ is not valid JSON in {url}: {exc}")
+        return None
+
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+    time.sleep(delay)
+    return data
+
+
+def extract_slugs(navigation: Any, prefixes: Iterable[str]) -> list[str]:
+    """Walk a nested page tree and return every slug that starts with a requested prefix."""
+    prefixes = tuple(p.strip("/") for p in prefixes)
+    found: list[str] = []
+
+    def walk(items: Any) -> None:
+        if not items:
+            return
+        if isinstance(items, dict):
+            walk(items.get("pages") or items.get("children") or [])
+            return
+        if not isinstance(items, list):
+            return
         for item in items:
-            slug = item.get('slug') or item.get('uri') or ''
-            slug = slug.strip('/')
-            
-            # Check if slug matches target prefixes
-            for pref in target_prefixes:
-                if slug.startswith(pref) and slug not in matched_slugs:
-                    matched_slugs.append(slug)
-                    
-            walk_tree(item.get('pages', []))
-            
-    walk_tree(pages_list)
-    return matched_slugs
+            if not isinstance(item, dict):
+                continue
+            slug = (item.get("slug") or item.get("uri") or "").strip("/")
+            if slug and slug.startswith(prefixes) and slug not in found:
+                found.append(slug)
+            walk(item.get("pages") or item.get("children") or [])
 
-def run_crawler(base_url, target_prefixes, output_dir="raw_data"):
-    """
-    Crawls and extracts structured JSON content for all subpages matching the prefixes.
-    """
-    base_url = base_url.rstrip('/')
-    print(f"Starting crawl of {base_url} with sections: {target_prefixes}")
-    
-    # 1. Fetch homepage to get page navigation tree
-    home_data = get_page_data(base_url)
-    if not home_data:
-        print("Failed to fetch starting URL configuration.")
-        return
-        
-    props = home_data.get('props', {})
-    page_props = props.get('pageProps', {})
-    navigation = page_props.get('pages') or page_props.get('navigation') or []
-    
+    walk(navigation)
+    return found
+
+
+def pick_navigation(data: dict, nav_paths: Iterable[str]) -> Any:
+    for path in nav_paths:
+        value = resolve_path(data, path)
+        if value:
+            return value
+    return None
+
+
+def pick_content(data: dict, content_paths: Iterable[str]) -> Any:
+    for path in content_paths:
+        value = resolve_path(data, path)
+        if value:
+            return value
+    return resolve_path(data, "props.pageProps") or data
+
+
+def run_crawler(
+    base_url: str,
+    sections: Iterable[str],
+    output_dir: str = "raw_data",
+    cache_dir: str = "cache",
+    nav_paths: Iterable[str] | None = None,
+    content_paths: Iterable[str] | None = None,
+    delay: float = 0.5,
+    user_agent: str = DEFAULT_USER_AGENT,
+    force: bool = False,
+) -> list[str]:
+    """Crawl every route in ``sections``. Returns the slugs that were written."""
+    base_url = base_url.rstrip("/")
+    sections = [s.strip() for s in sections if s.strip()]
+    nav_paths = tuple(nav_paths or DEFAULT_NAV_PATHS)
+    content_paths = tuple(content_paths or DEFAULT_CONTENT_PATHS)
+
+    print(f"Starting crawl of {base_url} with sections: {sections}")
+    home = fetch_page_data(base_url, cache_dir, delay, user_agent, force)
+    if not home:
+        print("Failed to fetch the entry page. Nothing to crawl.")
+        return []
+
+    navigation = pick_navigation(home, nav_paths)
     if not navigation:
-        # Check alternative locations in NextJS payload
-        navigation = props.get('pages') or props.get('navigation') or []
-        
-    slugs = extract_nested_paths(navigation, target_prefixes)
-    print(f"Found {len(slugs)} routes matching filters: {slugs}")
-    
-    # 2. Crawl routes
+        print("Warning: no navigation tree found at any of: " + ", ".join(nav_paths))
+        print("Set navigation_paths in your config to the JSON path this site uses.")
+        return []
+
+    slugs = extract_slugs(navigation, sections)
+    print(f"Found {len(slugs)} route(s) matching {sections}")
+    if not slugs:
+        print("No routes matched. Check the section names against the site navigation.")
+        return []
+
+    written: list[str] = []
     for slug in slugs:
-        page_url = f"{base_url}/{slug}"
-        print(f"Crawling route: {slug}")
-        data = get_page_data(page_url)
-        if not data: continue
-        
-        # Save page payload (nested under pageProps)
-        page_content = data.get('props', {}).get('pageProps', {}).get('page')
-        if not page_content:
-            # Fallback to whole payload if page is flat
-            page_content = data.get('props', {}).get('pageProps', data)
-            
-        # Determine output folder
-        category = "general"
-        for pref in target_prefixes:
-            if slug.startswith(pref):
-                category = pref
-                break
-                
-        cat_dir = os.path.join(output_dir, category)
-        os.makedirs(cat_dir, exist_ok=True)
-        
-        file_name = slug.replace(category + "/", "").replace("/", "-") + ".json"
-        with open(os.path.join(cat_dir, file_name), 'w') as f:
-            json.dump(page_content, f, indent=2)
-            
-    print("Crawl complete. Pages saved.")
+        data = fetch_page_data(f"{base_url}/{slug}", cache_dir, delay, user_agent, force)
+        if not data:
+            continue
+
+        page = pick_content(data, content_paths)
+        category = next((p for p in sections if slug.startswith(p)), "general")
+
+        category_dir = os.path.join(output_dir, category)
+        os.makedirs(category_dir, exist_ok=True)
+
+        relative = slug[len(category):].strip("/") if slug.startswith(category) else slug
+        file_name = (relative or slug).replace("/", "-") + ".json"
+        with open(os.path.join(category_dir, file_name), "w", encoding="utf-8") as handle:
+            json.dump(page, handle, indent=2, ensure_ascii=False)
+        written.append(slug)
+
+    print(f"Crawl complete. {len(written)} page(s) written to {output_dir}.")
+    return written
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="crawler.py",
+        description="Stage 1: discover routes on a Next.js design-documentation site.",
+        epilog="Example: crawler.py https://docs.wise.design/ foundations,components,patterns",
+    )
+    parser.add_argument("base_url", nargs="?", help="site root, for example https://docs.example.com/")
+    parser.add_argument("sections", nargs="?", help="comma-separated section names, for example components,patterns")
+    parser.add_argument("--config", help="JSON config file; overrides the positional arguments")
+    parser.add_argument("--output", default="raw_data", help="where to write the page JSON (default: raw_data)")
+    parser.add_argument("--cache", default="cache", help="HTTP cache directory (default: cache)")
+    parser.add_argument("--nav-path", action="append", dest="nav_paths",
+                        help="dotted JSON path to the route tree; repeatable")
+    parser.add_argument("--content-path", action="append", dest="content_paths",
+                        help="dotted JSON path to the page body; repeatable")
+    parser.add_argument("--delay", type=float, default=0.5, help="seconds between requests (default: 0.5)")
+    parser.add_argument("--force", action="store_true", help="ignore the cache and refetch")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config: dict = {}
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+
+    base_url = config.get("base_url") or args.base_url
+    sections = config.get("sections") or (args.sections.split(",") if args.sections else None)
+    if not base_url or not sections:
+        build_parser().print_help()
+        return 2
+
+    output = (config.get("output") or {}).get("raw") or args.output
+    delay = config.get("request_delay_seconds", args.delay)
+
+    run_crawler(
+        base_url=base_url,
+        sections=sections,
+        output_dir=output,
+        cache_dir=args.cache,
+        nav_paths=args.nav_paths or config.get("navigation_paths"),
+        content_paths=args.content_paths or config.get("content_paths"),
+        delay=delay,
+        force=args.force,
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    # Example usage targeting a Next.js documentation portal
-    import sys
-    if len(sys.argv) < 3:
-        print("Usage: python crawler.py [base_url] [section1,section2,...]")
-        print("Example: python crawler.py https://docs.wise.design/ foundations,components,patterns")
-    else:
-        base = sys.argv[1]
-        sections = sys.argv[2].split(',')
-        run_crawler(base, sections)
+    sys.exit(main())

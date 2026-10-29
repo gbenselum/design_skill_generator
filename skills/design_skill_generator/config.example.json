@@ -1,0 +1,44 @@
+{
+  "_comment": "Copy this file to config.json and edit it. Every key is optional except base_url and sections.",
+  "name": "wise-design",
+  "base_url": "https://docs.wise.design/",
+  "sections": ["foundations", "components", "patterns"],
+
+  "_comment_navigation": "The dotted JSON paths where this portal keeps its route tree. The first one that resolves wins. If the crawl finds zero routes, inspect the __NEXT_DATA__ block of the entry page and add the right path here.",
+  "navigation_paths": [
+    "props.pageProps.pages",
+    "props.pageProps.navigation",
+    "pageProps.pages",
+    "pageProps.navigation"
+  ],
+
+  "_comment_content": "Where the page body sits inside the payload.",
+  "content_paths": ["props.pageProps.page", "pageProps.page"],
+
+  "_comment_types": "Content-type ids and the role each one plays. Rename these to match another Contentful space. Unknown types are rendered as text, never dropped.",
+  "content_types": {
+    "image": ["figmaImage"],
+    "image_group": ["multipleFigmaImages"],
+    "table": ["table"],
+    "color_list": ["colorBlocks"],
+    "group": ["section"]
+  },
+
+  "output": {
+    "raw": "raw_data",
+    "assets": "assets",
+    "asset_map": "url_to_assets_map.json",
+    "references": "references"
+  },
+
+  "_comment_fonts": "Optional stage. Set url to null to skip it. weights matches file names, case-insensitive.",
+  "fonts": {
+    "url": "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip",
+    "weights": ["Regular", "Medium", "SemiBold", "Bold"],
+    "output": "fonts"
+  },
+
+  "request_delay_seconds": 0.5,
+  "asset_delay_seconds": 0.1,
+  "cache_dir": "cache"
+}
